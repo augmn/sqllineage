@@ -1,7 +1,7 @@
 import logging
 import warnings
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqllineage import DEFAULT_DIALECT, SQLPARSE_DIALECT
 from sqllineage.config import SQLLineageConfig
@@ -33,7 +33,7 @@ def lazy_property(func):
     return property(lazy_method(func))
 
 
-class LineageRunner:
+class LineageRunner(object):
     def __init__(
         self,
         sql: str,
@@ -41,7 +41,7 @@ class LineageRunner:
         metadata_provider: MetaDataProvider = DummyMetaDataProvider(),
         verbose: bool = False,
         silent_mode: bool = False,
-        draw_options: dict[str, Any] | None = None,
+        draw_options: Optional[Dict[str, Any]] = None,
         file_path: str = ".",
     ):
         """
@@ -66,7 +66,7 @@ class LineageRunner:
         self._verbose = verbose
         self._draw_options = draw_options if draw_options else {}
         self._evaluated = False
-        self._stmt: list[str] = []
+        self._stmt: List[str] = []
         self._dialect = dialect
         self._metadata_provider = metadata_provider
         self._silent_mode = silent_mode
@@ -105,7 +105,7 @@ Target Tables:
         return combined
 
     @lazy_method
-    def to_cytoscape(self, level=LineageLevel.TABLE) -> list[dict[str, dict[str, str]]]:
+    def to_cytoscape(self, level=LineageLevel.TABLE) -> List[Dict[str, Dict[str, str]]]:
         """
         to turn the DAG into cytoscape format.
         """
@@ -127,28 +127,28 @@ Target Tables:
         return draw_lineage_graph(**draw_options)
 
     @lazy_method
-    def statements(self) -> list[str]:
+    def statements(self) -> List[str]:
         """
         a list of SQL statements.
         """
         return [trim_comment(s) for s in self._stmt]
 
     @lazy_property
-    def source_tables(self) -> list[Table]:
+    def source_tables(self) -> List[Table]:
         """
         a list of source :class:`sqllineage.models.Table`
         """
         return sorted(self._sql_holder.source_tables, key=lambda x: str(x))
 
     @lazy_property
-    def target_tables(self) -> list[Table]:
+    def target_tables(self) -> List[Table]:
         """
         a list of target :class:`sqllineage.models.Table`
         """
         return sorted(self._sql_holder.target_tables, key=lambda x: str(x))
 
     @lazy_property
-    def intermediate_tables(self) -> list[Table]:
+    def intermediate_tables(self) -> List[Table]:
         """
         a list of intermediate :class:`sqllineage.models.Table`
         """
@@ -156,24 +156,30 @@ Target Tables:
 
     @lazy_method
     def get_column_lineage(
-        self, exclude_path_ending_in_subquery=True, exclude_subquery_columns=False
-    ) -> list[tuple[Column, Column]]:
+        self, exclude_path_ending_in_subquery=True, exclude_subquery_columns=False, exclude_intermediate_tables=False
+    ) -> List[Tuple[Column, Column]]:
         """
         a list of column tuple :class:`sqllineage.models.Column`
+        
+        :param exclude_path_ending_in_subquery: exclude column from SubQuery in the ending path
+        :param exclude_subquery_columns: exclude column from SubQuery in the path
+        :param exclude_intermediate_tables: exclude intermediate tables from the path, only show source and target tables
         """
         # sort by target column, and then source column
         return sorted(
             self._sql_holder.get_column_lineage(
-                exclude_path_ending_in_subquery, exclude_subquery_columns
+                exclude_path_ending_in_subquery, exclude_subquery_columns, exclude_intermediate_tables
             ),
             key=lambda x: (str(x[-1]), str(x[0])),
         )
 
-    def print_column_lineage(self) -> None:
+    def print_column_lineage(self, exclude_intermediate_tables=False) -> None:
         """
         print column level lineage to stdout
+        
+        :param exclude_intermediate_tables: exclude intermediate tables from the path, only show source and target tables
         """
-        for path in self.get_column_lineage():
+        for path in self.get_column_lineage(exclude_intermediate_tables=exclude_intermediate_tables):
             print(" <- ".join(str(col) for col in reversed(path)))
 
     def print_table_lineage(self) -> None:
@@ -217,7 +223,7 @@ Target Tables:
         self._evaluated = True
 
     @staticmethod
-    def supported_dialects() -> dict[str, list[str]]:
+    def supported_dialects() -> Dict[str, List[str]]:
         """
         an ordered dict (so we can make sure the default parser implementation comes first)
         with key, value as parser_name, dialect list respectively

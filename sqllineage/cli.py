@@ -8,11 +8,7 @@ from sqllineage import (
     DEFAULT_HOST,
     DEFAULT_LOGGING,
     DEFAULT_PORT,
-)
-from sqllineage import (
     NAME as MAIN_NAME,
-)
-from sqllineage import (
     VERSION as MAIN_VERSION,
 )
 from sqllineage.core.metadata.dummy import DummyMetaDataProvider
@@ -37,7 +33,7 @@ def main(args=None) -> None:
         prog="sqllineage", description="SQL Lineage Parser."
     )
     parser.add_argument(
-        "--version", action="version", version=f"{MAIN_NAME} {MAIN_VERSION}"
+        "--version", action="version", version="%s %s" % (MAIN_NAME, MAIN_VERSION)
     )
     parser.add_argument(
         "-e", metavar="<quoted-query-string>", help="SQL from command line"
@@ -102,6 +98,11 @@ def main(args=None) -> None:
         help="sqlalchemy url to provide metadata for lineage analysis",
         type=str,
     )
+    parser.add_argument(
+        "--exclude-intermediate-tables",
+        help="exclude intermediate tables from column lineage, only show source and target tables",
+        action="store_true",
+    )
     args = parser.parse_args(args)
     metadata_provider = (
         SQLAlchemyMetaDataProvider(args.sqlalchemy_url)
@@ -129,7 +130,7 @@ def main(args=None) -> None:
         if args.graph_visualization:
             runner.draw()
         elif args.level == LineageLevel.COLUMN:
-            runner.print_column_lineage()
+            runner.print_column_lineage(exclude_intermediate_tables=args.exclude_intermediate_tables)
         else:
             runner.print_table_lineage()
     elif args.graph_visualization:

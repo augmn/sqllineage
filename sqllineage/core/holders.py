@@ -1,50 +1,97 @@
 import itertools
+from typing import Dict, List, Optional, Set, Tuple, Union
 
-from sqllineage.core.graph.networkx import NetworkXGraphOperator
-from sqllineage.core.graph_operator import GraphOperator
+import networkx as nx
+from networkx import DiGraph
+
 from sqllineage.core.metadata_provider import MetaDataProvider
 from sqllineage.core.models import Column, Path, Schema, SubQuery, Table
-from sqllineage.utils.constant import EdgeDirection, EdgeTag, EdgeType, NodeTag
+from sqllineage.utils.constant import EdgeTag, EdgeType, NodeTag
 
 DATASET_CLASSES = (Path, Table)
 
 
 class ColumnLineageMixin:
     def get_column_lineage(
-        self, exclude_path_ending_in_subquery=True, exclude_subquery_columns=False
-    ) -> set[tuple[Column, ...]]:
+        self, exclude_path_ending_in_subquery=True, exclude_subquery_columns=False, exclude_intermediate_tables=False
+    ) -> Set[Tuple[Column, ...]]:
         """
         :param exclude_path_ending_in_subquery:  exclude_subquery rename to exclude_path_ending_in_subquery
                exclude column from SubQuery in the ending path
         :param exclude_subquery_columns: exclude column from SubQuery in the path.
+        :param exclude_intermediate_tables: exclude intermediate tables from the path, only show source and target tables.
 
         return a list of column tuple :class:`sqllineage.models.Column`
         """
-        self.go: GraphOperator  # For mypy attribute checking
+        self.graph: DiGraph  # For mypy attribute checking
         # filter all the column node in the graph
-        column_graph = self.go.get_sub_graph(
-            *[v for v in self.go.retrieve_vertices_by_props() if isinstance(v, Column)]
-        )
-        source_columns = column_graph.retrieve_source_vertices()
+        column_nodes = [n for n in self.graph.nodes if isinstance(n, Column)]
+        column_graph = self.graph.subgraph(column_nodes)
+        source_columns = {column for column, deg in column_graph.in_degree if deg == 0}
         # if a column lineage path ends at SubQuery, then it should be pruned
-        target_columns = column_graph.retrieve_target_vertices()
-
+        target_columns = {
+            node
+            for node, deg in column_graph.out_degree
+            if isinstance(node, Column) and deg == 0
+        }
         if exclude_path_ending_in_subquery:
             target_columns = {
                 node for node in target_columns if isinstance(node.parent, Table)
             }
         columns = set()
+
+        # Get intermediate tables if needed
+        intermediate_tables = set()
+        if exclude_intermediate_tables:
+            # Find all table and subquery nodes in the graph
+            table_subquery_nodes = [n for n in self.graph.nodes if isinstance(n, (Table, SubQuery))]
+            table_subquery_graph = self.graph.subgraph(table_subquery_nodes)
+
+            # 1. 传统的中间表：既有入度又有出度的表
+            traditional_intermediates = {
+                table for table, deg in table_subquery_graph.in_degree if deg > 0
+            }.intersection(
+                {table for table, deg in table_subquery_graph.out_degree if deg > 0}
+            )
+
+            # 2. 子查询：所有SubQuery类型的节点都是中间层
+            subquery_intermediates = {n for n in self.graph.nodes if isinstance(n, SubQuery)}
+
+            # 合并两种中间表
+            intermediate_tables = traditional_intermediates.union(subquery_intermediates)
+
+            # 排除自环表
+            intermediate_tables -= {table for table, attr in self.graph.nodes(data=True) if attr.get(NodeTag.SELFLOOP) is True}
+
         for source, target in itertools.product(source_columns, target_columns):
-            simple_paths = self.go.list_lineage_paths(source, target)
+            simple_paths = list(nx.all_simple_paths(self.graph, source, target))
             for path in simple_paths:
+                filtered_path = path.copy()
+
+                # Filter out subquery columns if needed
                 if exclude_subquery_columns:
-                    path = [
-                        node for node in path if not isinstance(node.parent, SubQuery)
+                    filtered_path = [
+                        node for node in filtered_path if not isinstance(node.parent, SubQuery)
                     ]
-                    if len(path) > 1:
-                        columns.add(tuple(path))
-                else:
-                    columns.add(tuple(path))
+                    if len(filtered_path) <= 1:
+                        continue
+
+                # Filter out intermediate tables if needed
+                if exclude_intermediate_tables:
+                    new_path = []
+                    for node in filtered_path:
+                        if node.parent in intermediate_tables:
+                            # Skip columns from intermediate tables/subqueries
+                            continue
+                        new_path.append(node)
+
+                    # Check if we have at least source and target columns
+                    if len(new_path) <= 1:
+                        continue
+
+                    filtered_path = new_path
+
+                columns.add(tuple(filtered_path))
         return columns
 
 
@@ -54,39 +101,36 @@ class SubQueryLineageHolder(ColumnLineageMixin):
 
     SubQueryLineageHolder will hold attributes like read, write, cte.
 
-    Each of them is a set[:class:`sqllineage.core.models.Table`].
+    Each of them is a Set[:class:`sqllineage.core.models.Table`].
 
     This is the most atomic representation of lineage result.
     """
 
     def __init__(self) -> None:
-        self.go = NetworkXGraphOperator()
+        self.graph = nx.DiGraph()
 
     def __or__(self, other):
-        self.go.merge(other.go)
+        self.graph = nx.compose(self.graph, other.graph)
         return self
 
-    def _property_getter(self, prop) -> set[SubQuery | Table]:
-        vertices: list[SubQuery | Table] = self.go.retrieve_vertices_by_props(
-            **{prop: True}
-        )
-        return {t for t in vertices}
+    def _property_getter(self, prop) -> Set[Union[SubQuery, Table]]:
+        return {t for t, attr in self.graph.nodes(data=True) if attr.get(prop) is True}
 
     def _property_setter(self, value, prop) -> None:
-        self.go.add_vertex_if_not_exist(value, **{prop: True})
+        self.graph.add_node(value, **{prop: True})
 
     @property
-    def read(self) -> set[SubQuery | Table]:
+    def read(self) -> Set[Union[SubQuery, Table]]:
         return self._property_getter(NodeTag.READ)
 
     def add_read(self, value) -> None:
         self._property_setter(value, NodeTag.READ)
         # the same table can be added (in SQL: joined) multiple times with different alias
         if hasattr(value, "alias"):
-            self.go.add_edge_if_not_exist(value, value.alias, EdgeType.HAS_ALIAS)
+            self.graph.add_edge(value, value.alias, type=EdgeType.HAS_ALIAS)
 
     @property
-    def write(self) -> set[SubQuery | Table]:
+    def write(self) -> Set[Union[SubQuery, Table]]:
         # SubQueryLineageHolder.write can return a single SubQuery or Table, or both when __or__ together.
         # This is different from StatementLineageHolder.write, where Table is the only possibility.
         return self._property_getter(NodeTag.WRITE)
@@ -95,14 +139,14 @@ class SubQueryLineageHolder(ColumnLineageMixin):
         self._property_setter(value, NodeTag.WRITE)
 
     @property
-    def cte(self) -> set[SubQuery]:
+    def cte(self) -> Set[SubQuery]:
         return self._property_getter(NodeTag.CTE)  # type: ignore
 
     def add_cte(self, value) -> None:
         self._property_setter(value, NodeTag.CTE)
 
     @property
-    def write_columns(self) -> list[Column]:
+    def write_columns(self) -> List[Column]:
         """
         return a list of columns that write table contains.
         It's either manually added via `add_write_column` if specified in DML
@@ -110,11 +154,12 @@ class SubQueryLineageHolder(ColumnLineageMixin):
         """
         tgt_cols = []
         if tgt_tbl := self._get_target_table():
-            tbl_col_edges = self.go.retrieve_edges_by_vertex(
-                tgt_tbl, EdgeDirection.OUT, EdgeType.HAS_COLUMN
-            )
-            tgt_col_with_idx: list[tuple[Column, int]] = sorted(
-                [(e.target, e.attributes.get(EdgeTag.INDEX, 0)) for e in tbl_col_edges],
+            tgt_col_with_idx: List[Tuple[Column, int]] = sorted(
+                [
+                    (col, attr.get(EdgeTag.INDEX, 0))
+                    for tbl, col, attr in self.graph.out_edges(tgt_tbl, data=True)
+                    if attr["type"] == EdgeType.HAS_COLUMN
+                ],
                 key=lambda x: x[1],
             )
             tgt_cols = [x[0] for x in tgt_col_with_idx]
@@ -135,25 +180,27 @@ class SubQueryLineageHolder(ColumnLineageMixin):
             tgt_tbl = list(self.write)[0]
             for idx, tgt_col in enumerate(tgt_cols):
                 tgt_col.parent = tgt_tbl
-                self.go.add_edge_if_not_exist(
-                    tgt_tbl, tgt_col, EdgeType.HAS_COLUMN, **{EdgeTag.INDEX: idx}
+                self.graph.add_edge(
+                    tgt_tbl, tgt_col, type=EdgeType.HAS_COLUMN, **{EdgeTag.INDEX: idx}
                 )
 
     def add_column_lineage(self, src: Column, tgt: Column) -> None:
         """
         link source column to target.
         """
-        self.go.add_edge_if_not_exist(src, tgt, EdgeType.LINEAGE)
-        self.go.add_edge_if_not_exist(tgt.parent, tgt, EdgeType.HAS_COLUMN)
-        self.go.add_edge_if_not_exist(src.parent, src, EdgeType.HAS_COLUMN)
+        self.graph.add_edge(src, tgt, type=EdgeType.LINEAGE)
+        self.graph.add_edge(tgt.parent, tgt, type=EdgeType.HAS_COLUMN)
+        if src.parent is not None:
+            # starting NetworkX v2.6, None is not allowed as node, see https://github.com/networkx/networkx/pull/4892
+            self.graph.add_edge(src.parent, src, type=EdgeType.HAS_COLUMN)
 
-    def get_table_columns(self, table: Table | SubQuery) -> list[Column]:
+    def get_table_columns(self, table: Union[Table, SubQuery]) -> List[Column]:
         return [
-            edge.target
-            for edge in self.go.retrieve_edges_by_vertex(
-                table, EdgeDirection.OUT, EdgeType.HAS_COLUMN
-            )
-            if isinstance(edge.target, Column) and edge.target.raw_name != "*"
+            tgt
+            for (src, tgt, edge_type) in self.graph.out_edges(nbunch=table, data="type")
+            if edge_type == EdgeType.HAS_COLUMN
+            and isinstance(tgt, Column)
+            and tgt.raw_name != "*"
         ]
 
     def expand_wildcard(self, metadata_provider: MetaDataProvider) -> None:
@@ -161,14 +208,7 @@ class SubQueryLineageHolder(ColumnLineageMixin):
             for column in self.write_columns:
                 if column.raw_name == "*":
                     tgt_wildcard = column
-                    src_wildcards = self.get_source_columns(tgt_wildcard)
-                    # Enable positional mapping only for UNION-of-* into a real table; avoid join/subquery cases
-                    wildcard_in_union = (
-                        isinstance(tgt_table, Table)
-                        and len(self.write_columns) == 1
-                        and len(src_wildcards) > 1
-                    )
-                    for src_wildcard in src_wildcards:
+                    for src_wildcard in self.get_source_columns(tgt_wildcard):
                         if source_table := src_wildcard.parent:
                             src_table_columns = []
                             if isinstance(source_table, SubQuery):
@@ -185,83 +225,63 @@ class SubQueryLineageHolder(ColumnLineageMixin):
                                     src_table_columns,
                                     tgt_wildcard,
                                     src_wildcard,
-                                    wildcard_in_union=wildcard_in_union,
                                 )
 
     def get_alias_mapping_from_table_group(
-        self, table_group: list[Path | Table | SubQuery]
-    ) -> dict[str, Path | Table | SubQuery]:
+        self, table_group: List[Union[Path, Table, SubQuery]]
+    ) -> Dict[str, Union[Path, Table, SubQuery]]:
         """
         A table can be referred to as alias, table name, or database_name.table_name, create the mapping here.
         For SubQuery, it's only alias then.
         """
-        alias_map = {
-            edge.target: edge.source
-            for edge in self.go.retrieve_edges_by_label(label=EdgeType.HAS_ALIAS)
-            if edge.source in table_group
+        return {
+            **{
+                tgt: src
+                for src, tgt, attr in self.graph.edges(data=True)
+                if attr.get("type") == EdgeType.HAS_ALIAS and src in table_group
+            },
+            **{
+                table.raw_name: table
+                for table in table_group
+                if isinstance(table, Table)
+            },
+            **{str(table): table for table in table_group if isinstance(table, Table)},
         }
-        unqualified_map = {
-            table.raw_name: table for table in table_group if isinstance(table, Table)
-        }
-        qualified_map = {
-            str(table): table for table in table_group if isinstance(table, Table)
-        }
-        return alias_map | unqualified_map | qualified_map
 
-    def _get_target_table(self) -> SubQuery | Table | None:
+    def _get_target_table(self) -> Optional[Union[SubQuery, Table]]:
         table = None
         if write_only := self.write.difference(self.read):
             table = next(iter(write_only))
         return table
 
-    def get_source_columns(self, node: Column) -> list[Column]:
+    def get_source_columns(self, node: Column) -> List[Column]:
         return [
-            e.source
-            for e in self.go.retrieve_edges_by_vertex(
-                node, EdgeDirection.IN, EdgeType.LINEAGE
-            )
-            if isinstance(e.source, Column)
+            src
+            for (src, tgt, edge_type) in self.graph.in_edges(nbunch=node, data="type")
+            if edge_type == EdgeType.LINEAGE and isinstance(src, Column)
         ]
 
     def _replace_wildcard(
         self,
-        tgt_table: Table | SubQuery,
-        src_table_columns: list[Column],
+        tgt_table: Union[Table, SubQuery],
+        src_table_columns: List[Column],
         tgt_wildcard: Column,
         src_wildcard: Column,
-        wildcard_in_union: bool = False,
     ) -> None:
         target_columns = self.get_table_columns(tgt_table)
-        for idx, src_col in enumerate(src_table_columns):
-            # Prefer positional mapping only when enabled (e.g., subsequent UNION arms)
-            if wildcard_in_union and idx < len(target_columns):
-                target_col = target_columns[idx]
-            else:
-                # otherwise, if target column with same name exists (union scenario), reuse it; or create a new one
-                existing_col = next(
-                    (c for c in target_columns if c.raw_name == src_col.raw_name),
-                    None,
-                )
-                if existing_col is None:
-                    new_column = Column(src_col.raw_name)
-                    new_column.parent = tgt_table
-                    self.go.add_edge_if_not_exist(
-                        tgt_table, new_column, EdgeType.HAS_COLUMN
-                    )
-                    target_col = new_column
-                    # keep local target_columns in sync to preserve order for the same call
-                    target_columns.append(target_col)
-                else:
-                    target_col = existing_col
-            # ensure source column node exists and link lineage
-            if src_col.parent is not None:
-                self.go.add_edge_if_not_exist(
-                    src_col.parent, src_col, EdgeType.HAS_COLUMN
-                )
-            self.go.add_edge_if_not_exist(src_col, target_col, EdgeType.LINEAGE)
+        for src_col in src_table_columns:
+            new_column = Column(src_col.raw_name)
+            new_column.parent = tgt_table
+            if new_column in target_columns or src_col.raw_name == "*":
+                continue
+            self.graph.add_edge(tgt_table, new_column, type=EdgeType.HAS_COLUMN)
+            self.graph.add_edge(src_col.parent, src_col, type=EdgeType.HAS_COLUMN)
+            self.graph.add_edge(src_col, new_column, type=EdgeType.LINEAGE)
         # remove wildcard
-        self.go.drop_vertices(tgt_wildcard)
-        self.go.drop_vertices(src_wildcard)
+        if self.graph.has_node(tgt_wildcard):
+            self.graph.remove_node(tgt_wildcard)
+        if self.graph.has_node(src_wildcard):
+            self.graph.remove_node(src_wildcard)
 
 
 class StatementLineageHolder(SubQueryLineageHolder, ColumnLineageMixin):
@@ -270,9 +290,9 @@ class StatementLineageHolder(SubQueryLineageHolder, ColumnLineageMixin):
 
     Based on SubQueryLineageHolder, StatementLineageHolder holds extra attributes like drop and rename
 
-    For drop, it is a set[:class:`sqllineage.core.models.Table`].
+    For drop, it is a Set[:class:`sqllineage.core.models.Table`].
 
-    For rename, it a set[tuple[:class:`sqllineage.core.models.Table`, :class:`sqllineage.core.models.Table`]],
+    For rename, it a Set[Tuple[:class:`sqllineage.core.models.Table`, :class:`sqllineage.core.models.Table`]],
     with the first table being original table before renaming and the latter after renaming.
     """
 
@@ -286,204 +306,166 @@ class StatementLineageHolder(SubQueryLineageHolder, ColumnLineageMixin):
         return str(self)
 
     @property
-    def read(self) -> set[Table]:  # type: ignore
+    def read(self) -> Set[Table]:  # type: ignore
         return {t for t in super().read if isinstance(t, DATASET_CLASSES)}
 
     @property
-    def write(self) -> set[Table]:  # type: ignore
+    def write(self) -> Set[Table]:  # type: ignore
         return {t for t in super().write if isinstance(t, DATASET_CLASSES)}
 
     @property
-    def drop(self) -> set[Table]:
+    def drop(self) -> Set[Table]:
         return self._property_getter(NodeTag.DROP)  # type: ignore
 
     def add_drop(self, value) -> None:
         self._property_setter(value, NodeTag.DROP)
 
     @property
-    def rename(self) -> set[tuple[Table, Table]]:
+    def rename(self) -> Set[Tuple[Table, Table]]:
         return {
-            (e.source, e.target)
-            for e in self.go.retrieve_edges_by_label(EdgeType.RENAME)
+            (src, tgt)
+            for src, tgt, attr in self.graph.edges(data=True)
+            if attr.get("type") == EdgeType.RENAME
         }
 
     def add_rename(self, src: Table, tgt: Table) -> None:
-        self.go.add_edge_if_not_exist(src, tgt, EdgeType.RENAME)
+        self.graph.add_edge(src, tgt, type=EdgeType.RENAME)
 
     @staticmethod
     def of(holder: SubQueryLineageHolder) -> "StatementLineageHolder":
         stmt_holder = StatementLineageHolder()
-        stmt_holder.go = holder.go
+        stmt_holder.graph = holder.graph
         return stmt_holder
 
 
 class SQLLineageHolder(ColumnLineageMixin):
-    def __init__(self, go: GraphOperator):
+    def __init__(self, graph: DiGraph):
         """
         The combined lineage result in representation of Directed Acyclic Graph.
 
-        :param go: the Graph Operator holding all the combined lineage result.
+        :param graph: the Directed Acyclic Graph holding all the combined lineage result.
         """
-        self.go = go
+        self.graph = graph
         self._selfloop_tables = self.__retrieve_tag_tables(NodeTag.SELFLOOP)
         self._sourceonly_tables = self.__retrieve_tag_tables(NodeTag.SOURCE_ONLY)
         self._targetonly_tables = self.__retrieve_tag_tables(NodeTag.TARGET_ONLY)
 
     @property
-    def table_lineage_graph(self) -> GraphOperator:
+    def table_lineage_graph(self) -> DiGraph:
         """
-        The table level GraphOperator held by SQLLineageHolder
+        The table level DiGraph held by SQLLineageHolder
         """
-        table_nodes = [  # type: ignore[var-annotated]
-            v
-            for v in self.go.retrieve_vertices_by_props()
-            if isinstance(v, DATASET_CLASSES)
-        ]
-        return self.go.get_sub_graph(*table_nodes)
+        table_nodes = [n for n in self.graph.nodes if isinstance(n, DATASET_CLASSES)]
+        return self.graph.subgraph(table_nodes)
 
     @property
-    def column_lineage_graph(self) -> GraphOperator:
+    def column_lineage_graph(self) -> DiGraph:
         """
-        The column level GraphOperator held by SQLLineageHolder
+        The column level DiGraph held by SQLLineageHolder
         """
-        column_nodes = [  # type: ignore[var-annotated]
-            v for v in self.go.retrieve_vertices_by_props() if isinstance(v, Column)
-        ]
-        return self.go.get_sub_graph(*column_nodes)
+        column_nodes = [n for n in self.graph.nodes if isinstance(n, Column)]
+        return self.graph.subgraph(column_nodes)
 
     @property
-    def source_tables(self) -> set[Table | Path]:
+    def source_tables(self) -> Set[Table]:
         """
         a list of source :class:`sqllineage.core.models.Table`
         """
-        source_tables = set(self.table_lineage_graph.retrieve_source_vertices())
+        source_tables = {
+            table for table, deg in self.table_lineage_graph.in_degree if deg == 0
+        }.intersection(
+            {table for table, deg in self.table_lineage_graph.out_degree if deg > 0}
+        )
         source_tables |= self._selfloop_tables
         source_tables |= self._sourceonly_tables
         return source_tables
 
     @property
-    def target_tables(self) -> set[Table | Path]:
+    def target_tables(self) -> Set[Table]:
         """
         a list of target :class:`sqllineage.core.models.Table`
         """
-        target_tables = set(self.table_lineage_graph.retrieve_target_vertices())
+        target_tables = {
+            table for table, deg in self.table_lineage_graph.out_degree if deg == 0
+        }.intersection(
+            {table for table, deg in self.table_lineage_graph.in_degree if deg > 0}
+        )
         target_tables |= self._selfloop_tables
         target_tables |= self._targetonly_tables
         return target_tables
 
     @property
-    def intermediate_tables(self) -> set[Table | Path]:
+    def intermediate_tables(self) -> Set[Table]:
         """
         a list of intermediate :class:`sqllineage.core.models.Table`
         """
-        all_tables: list[Table | Path] = (
-            self.table_lineage_graph.retrieve_vertices_by_props()
-        )
         intermediate_tables = {
-            table
-            for table in all_tables
-            if len(
-                self.table_lineage_graph.retrieve_edges_by_vertex(
-                    table, EdgeDirection.IN
-                )
-            )
-            > 0
-            and len(
-                self.table_lineage_graph.retrieve_edges_by_vertex(
-                    table, EdgeDirection.OUT
-                )
-            )
-            > 0
-        }
+            table for table, deg in self.table_lineage_graph.in_degree if deg > 0
+        }.intersection(
+            {table for table, deg in self.table_lineage_graph.out_degree if deg > 0}
+        )
         intermediate_tables -= self.__retrieve_tag_tables(NodeTag.SELFLOOP)
         return intermediate_tables
 
-    def __retrieve_tag_tables(self, tag) -> set[Path | Table]:
-        return {  # type: ignore[var-annotated]
-            vertex
-            for vertex in self.go.retrieve_vertices_by_props(**{tag: True})
-            if isinstance(vertex, DATASET_CLASSES)
+    def __retrieve_tag_tables(self, tag) -> Set[Union[Path, Table]]:
+        return {
+            table
+            for table, attr in self.graph.nodes(data=True)
+            if attr.get(tag) is True and isinstance(table, DATASET_CLASSES)
         }
 
     @staticmethod
-    def of(metadata_provider, *args: StatementLineageHolder) -> "SQLLineageHolder":
-        """
-        To assemble multiple :class:`sqllineage.core.holders.StatementLineageHolder` into
-        :class:`sqllineage.core.holders.SQLLineageHolder`
-        """
-        ngo = NetworkXGraphOperator()
+    def _build_digraph(
+        metadata_provider: MetaDataProvider, *args: StatementLineageHolder
+    ) -> DiGraph:
+        g = DiGraph()
         for holder in args:
-            ngo.merge(holder.go)
+            g = nx.compose(g, holder.graph)
             if holder.drop:
                 for table in holder.drop:
-                    if (
-                        len(ngo.retrieve_edges_by_vertex(table, EdgeDirection.IN)) == 0
-                        and len(ngo.retrieve_edges_by_vertex(table, EdgeDirection.OUT))
-                        == 0
-                    ):
-                        ngo.drop_vertices(table)
+                    if g.has_node(table) and g.degree[table] == 0:
+                        g.remove_node(table)
             elif holder.rename:
                 for table_old, table_new in holder.rename:
-                    for edge in ngo.retrieve_edges_by_vertex(
-                        table_old, EdgeDirection.IN
-                    ):
-                        ngo.add_edge_if_not_exist(
-                            edge.source, table_new, edge.label, **edge.attributes
-                        )
-                    for edge in ngo.retrieve_edges_by_vertex(
-                        table_old, EdgeDirection.OUT
-                    ):
-                        ngo.add_edge_if_not_exist(
-                            table_new, edge.target, edge.label, **edge.attributes
-                        )
-                    ngo.drop_vertices(table_old)
-                    # remove possible self-loop edge created by rename
-                    ngo.drop_edge(table_new, table_new)
-                    if (
-                        len(ngo.retrieve_edges_by_vertex(table_new, EdgeDirection.IN))
-                        == 0
-                        and len(
-                            ngo.retrieve_edges_by_vertex(table_new, EdgeDirection.OUT)
-                        )
-                        == 0
-                    ):
-                        ngo.drop_vertices(table_new)
+                    g = nx.relabel_nodes(g, {table_old: table_new})
+                    g.remove_edge(table_new, table_new)
+                    if g.degree[table_new] == 0:
+                        g.remove_node(table_new)
             else:
                 read, write = holder.read, holder.write
                 if len(read) > 0 and len(write) == 0:
                     # source only table comes from SELECT statement
-                    ngo.update_vertices(*read, **{NodeTag.SOURCE_ONLY: True})
+                    nx.set_node_attributes(
+                        g, {table: True for table in read}, NodeTag.SOURCE_ONLY
+                    )
                 elif len(read) == 0 and len(write) > 0:
                     # target only table comes from case like: 1) INSERT/UPDATE constant values; 2) CREATE TABLE
-                    ngo.update_vertices(*write, **{NodeTag.TARGET_ONLY: True})
+                    nx.set_node_attributes(
+                        g, {table: True for table in write}, NodeTag.TARGET_ONLY
+                    )
                 else:
                     for source, target in itertools.product(read, write):
-                        ngo.add_edge_if_not_exist(source, target, EdgeType.LINEAGE)
-        # selfloop table comes from cases like: INSERT INTO tbl (part='xx') SELECT * FROM tbl WHERE part = ''
-        ngo.update_vertices(
-            *ngo.retrieve_selfloop_vertices(), **{NodeTag.SELFLOOP: True}
+                        g.add_edge(source, target, type=EdgeType.LINEAGE)
+        nx.set_node_attributes(
+            g,
+            {table: True for table in {e[0] for e in nx.selfloop_edges(g)}},
+            NodeTag.SELFLOOP,
         )
         # find all the columns that we can't assign accurately to a parent table (with multiple parent candidates)
-        unresolved_column_lineages = [
-            (e.source, e.target)
-            for e in ngo.retrieve_edges_by_label(label=EdgeType.LINEAGE)
-            if isinstance(e.source, Column) and len(e.source.parent_candidates) > 1
+        unresolved_cols = [
+            (s, t)
+            for s, t in g.edges
+            if isinstance(s, Column) and len(s.parent_candidates) > 1
         ]
-        for unresolved_col, tgt_col in unresolved_column_lineages:
+        for unresolved_col, tgt_col in unresolved_cols:
             # check if there's only one parent candidate contains the column with same name
             src_cols = []
             # check if source column exists in graph (either from subquery or from table created in prev statement)
             for parent in unresolved_col.parent_candidates:
-                src_col_candidate = Column(unresolved_col.raw_name)
-                src_col_candidate.parent = parent
-                parent_columns = [
-                    e.target
-                    for e in ngo.retrieve_edges_by_vertex(
-                        parent, EdgeDirection.OUT, EdgeType.HAS_COLUMN
-                    )
-                ]
-                if src_col_candidate in parent_columns:
-                    src_cols.append(src_col_candidate)
+                src_col = Column(unresolved_col.raw_name)
+                src_col.parent = parent
+                if g.has_edge(parent, src_col):
+                    src_cols.append(src_col)
             # if not in graph, check if defined in table schema by metadata service
             if len(src_cols) == 0 and bool(metadata_provider):
                 for parent in unresolved_col.parent_candidates:
@@ -491,25 +473,30 @@ class SQLLineageHolder(ColumnLineageMixin):
                         isinstance(parent, Table)
                         and str(parent.schema) != Schema.unknown
                     ):
-                        for parent_col in metadata_provider.get_table_columns(parent):
-                            if unresolved_col.raw_name == parent_col.raw_name:
-                                src_cols.append(parent_col)
+                        columns = metadata_provider.get_table_columns(parent)
+                        for src_col in columns:
+                            if unresolved_col.raw_name == src_col.raw_name:
+                                src_cols.append(src_col)
 
             # Multiple sources is a correct case for JOIN with USING
             # It incorrect for JOIN with ON, but sql without specifying an alias in this case will be invalid
             for src_col in src_cols:
-                ngo.add_edge_if_not_exist(src_col, tgt_col, EdgeType.LINEAGE)
+                g.add_edge(src_col, tgt_col, type=EdgeType.LINEAGE)
             if len(src_cols) > 0:
                 # only delete unresolved column when it's resolved
-                ngo.drop_edge(unresolved_col, tgt_col)
+                g.remove_edge(unresolved_col, tgt_col)
 
         # when unresolved column got resolved, it will be orphan node, and we can remove it
-        for unresolved_col, _ in unresolved_column_lineages:
-            if (
-                len(ngo.retrieve_edges_by_vertex(unresolved_col, EdgeDirection.OUT))
-                == 0
-                and len(ngo.retrieve_edges_by_vertex(unresolved_col, EdgeDirection.IN))
-                == 0
-            ):
-                ngo.drop_vertices(unresolved_col)
-        return SQLLineageHolder(ngo)
+        for node in [n for n, deg in g.degree if deg == 0]:
+            if isinstance(node, Column) and len(node.parent_candidates) > 1:
+                g.remove_node(node)
+        return g
+
+    @staticmethod
+    def of(metadata_provider, *args: StatementLineageHolder) -> "SQLLineageHolder":
+        """
+        To assemble multiple :class:`sqllineage.core.holders.StatementLineageHolder` into
+        :class:`sqllineage.core.holders.SQLLineageHolder`
+        """
+        g = SQLLineageHolder._build_digraph(metadata_provider, *args)
+        return SQLLineageHolder(g)
