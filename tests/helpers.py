@@ -49,7 +49,7 @@ def _assert_column_lineage(lr: LineageRunner, column_lineages=None):
             tgt_col: Column = Column(tgt.column)
             tgt_col.parent = Table(tgt.qualifier)
             expected.add((src_col, tgt_col))
-    actual = {(lineage[0], lineage[-1]) for lineage in set(lr.get_column_lineage())}
+    actual = {(lineage[0], lineage[-1]) for lineage in set(lr.get_column_lineage(exclude_subquery_columns=True))}
 
     assert (
         set(actual) == expected

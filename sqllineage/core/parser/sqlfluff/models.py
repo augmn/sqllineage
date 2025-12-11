@@ -198,21 +198,69 @@ class SqlFluffColumn(Column):
         :param sub_segment: segment to be processed
         :return: A list of source columns from a segment
         """
-        # This is to avoid circular import
-        from sqllineage.runner import LineageRunner
-
-        src_cols = [
-            lineage[0]
-            for lineage in LineageRunner(
-                sub_segment.raw, dialect=SQLPARSE_DIALECT
-            ).get_column_lineage(exclude_path_ending_in_subquery=False)
-        ]
-        source_columns = [
-            ColumnQualifierTuple(
-                src_col.raw_name, src_col.parent.raw_name if src_col.parent else None
-            )
-            for src_col in src_cols
-        ]
+        # 提取子查询中的所有表引用及其别名映射
+        table_alias_map = {}
+        for from_clause in sub_segment.recursive_crawl('from_clause'):
+            # 处理FROM子句中的表
+            for from_expr_element in from_clause.get_children('from_expression_element'):
+                # 获取表引用和别名
+                as_segment, target = extract_as_and_target_segment(from_expr_element)
+                if not is_subquery(target):
+                    table_reference = target.segments[0] if hasattr(target, 'segments') else target
+                    table = SqlFluffTable.of(table_reference)
+                    alias = extract_identifier(as_segment) if as_segment else None
+                    full_table_name = f"{table.schema.name}.{table.raw_name}" if table.schema and table.schema.name else table.raw_name
+                    if alias:
+                        table_alias_map[alias] = full_table_name
+                    table_alias_map[table.raw_name] = full_table_name
+            
+            # 处理JOIN子句中的表
+            for join_clause in from_clause.get_children('join_clause'):
+                for from_expr_element in join_clause.get_children('from_expression_element'):
+                    as_segment, target = extract_as_and_target_segment(from_expr_element)
+                    if not is_subquery(target):
+                        table_reference = target.segments[0] if hasattr(target, 'segments') else target
+                        table = SqlFluffTable.of(table_reference)
+                        alias = extract_identifier(as_segment) if as_segment else None
+                        full_table_name = f"{table.schema.name}.{table.raw_name}" if table.schema and table.schema.name else table.raw_name
+                        if alias:
+                            table_alias_map[alias] = full_table_name
+                        table_alias_map[table.raw_name] = full_table_name
+        
+        if not table_alias_map:
+            return []
+        
+        # 检查子查询的选择列表是否包含通配符
+        select_clause = next(sub_segment.recursive_crawl('select_clause'), None)
+        if not select_clause:
+            return []
+        
+        wildcard_segments = list(select_clause.recursive_crawl('wildcard_expression'))
+        
+        source_columns = []
+        
+        # 如果有通配符，返回所有表的通配符引用
+        if wildcard_segments:
+            for alias, full_table_name in table_alias_map.items():
+                source_columns.append(ColumnQualifierTuple('*', full_table_name))
+        else:
+            # 如果没有通配符，提取选择列表中的列
+            for select_clause_element in select_clause.get_children('select_clause_element'):
+                # 获取列名和别名
+                source_cols, alias = SqlFluffColumn._get_column_and_alias(select_clause_element)
+                if source_cols:
+                    # 如果有源列，使用源列信息
+                    source_columns.extend(source_cols)
+                else:
+                    # 否则，提取列引用
+                    for column_reference in select_clause_element.recursive_crawl('column_reference'):
+                        if cqt := extract_column_qualifier(column_reference):
+                            # 如果有表别名，替换为完整表名
+                            if cqt.qualifier and cqt.qualifier in table_alias_map:
+                                source_columns.append(ColumnQualifierTuple(cqt.column, table_alias_map[cqt.qualifier]))
+                            else:
+                                source_columns.append(cqt)
+        
         return source_columns
 
     @staticmethod

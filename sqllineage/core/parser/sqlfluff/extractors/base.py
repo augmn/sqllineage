@@ -232,7 +232,8 @@ class BaseExtractor:
                 self.dialect, self.metadata_provider
             ).extract(sq.query, AnalyzerContext(cte=holder.cte, write={sq}))
             # remove WRITE tag from subquery so that the combined holder won't have multiple WRITE dataset
-            subquery_holder.go.update_vertices(sq, **{NodeTag.WRITE: False})
+            if subquery_holder.graph.has_node(sq):
+                subquery_holder.graph.nodes[sq][NodeTag.WRITE] = False
             holder |= subquery_holder
 
     @staticmethod
